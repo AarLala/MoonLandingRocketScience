@@ -29,14 +29,19 @@ namespace RocketScienceCleaned
                 Console.WriteLine("  Validating fuel allocation constraints...");
             }
 
+            double baseCost = 0.0;
+            double penalty = 0.0;
+            const double w_launch = 1e6;
+            const double w_loi = 1e6;
+            const double w_land = 1e6;
+            const double w_alt = 1e2;
+
             if (landingFuel <= 0 || landingFuel >= rocket.TotalFuel)
             {
-                if (verbose)
-                {
-                    Console.WriteLine("  Validation failed: Landing fuel out of bounds");
-                }
-                parameters.Cost = double.MaxValue;
-                return double.MaxValue;
+                double violation = landingFuel <= 0 ? Math.Abs(landingFuel) : Math.Abs(landingFuel - rocket.TotalFuel);
+                penalty += w_launch * violation * violation;
+                parameters.Cost = baseCost + penalty;
+                return baseCost + penalty;
             }
 
             if (verbose)
@@ -50,12 +55,11 @@ namespace RocketScienceCleaned
             
             if (!launchResult.Success)
             {
-                if (verbose)
-                {
-                    Console.WriteLine("  Launch phase failed: Insufficient delta-V");
-                }
-                parameters.Cost = double.MaxValue;
-                return double.MaxValue;
+                double targetOrbitVelocity = CalculateCircularOrbitVelocity(PhysicalConstants.EarthRadius + PhysicalConstants.LowEarthOrbitAltitude, PhysicalConstants.EarthMass);
+                double dvRequired = targetOrbitVelocity;
+                double dvAchieved = launchResult.DeltaV;
+                double dvDeficit = Math.Max(0, dvRequired - dvAchieved);
+                penalty += w_launch * dvDeficit * dvDeficit;
             }
 
             parameters.LaunchTime = launchResult.Time;
@@ -83,14 +87,11 @@ namespace RocketScienceCleaned
             double minRequiredAltitude = PhysicalConstants.LowEarthOrbitAltitude * 0.8;
             if (velocityRatio < 0.88 || parameters.LaunchOrbitalAltitude < minRequiredAltitude)
             {
-                if (verbose)
-                {
-                    Console.WriteLine("  Validation failed: Insufficient velocity for circular orbit");
-                    Console.WriteLine("  Required velocity ratio: 0.95, Achieved: " + velocityRatio.ToString("F3"));
-                    Console.WriteLine("  Required altitude: " + minRequiredAltitude.ToString("F0") + " m, Achieved: " + parameters.LaunchOrbitalAltitude.ToString("F0") + " m");
-                }
-                parameters.Cost = double.MaxValue;
-                return double.MaxValue;
+                double targetRatio = 0.88;
+                double ratioDeficit = Math.Max(0, targetRatio - velocityRatio);
+                double altDeficit = Math.Max(0, minRequiredAltitude - parameters.LaunchOrbitalAltitude);
+                penalty += w_launch * (ratioDeficit * circularOrbitVelocityAtAltitude) * (ratioDeficit * circularOrbitVelocityAtAltitude);
+                penalty += w_launch * altDeficit * altDeficit / 1e6;
             }
 
             if (verbose)
@@ -102,12 +103,7 @@ namespace RocketScienceCleaned
             
             if (!transferResult.Success)
             {
-                if (verbose)
-                {
-                    Console.WriteLine("  Transfer orbit calculation failed");
-                }
-                parameters.Cost = double.MaxValue;
-                return double.MaxValue;
+                penalty += w_loi * 1e6;
             }
 
             parameters.TransferOrbitPerigeeVelocity = transferResult.PerigeeVelocity;
@@ -123,8 +119,9 @@ namespace RocketScienceCleaned
             {
                 Console.WriteLine("  Transfer orbit perigee velocity: " + transferResult.PerigeeVelocity.ToString("F2") + " m/s");
                 Console.WriteLine("  Transfer orbit apogee velocity: " + transferResult.ApogeeVelocity.ToString("F2") + " m/s");
-                Console.WriteLine("  Transfer orbit period: " + transferResult.Period.ToString("F2") + " seconds");
-                Console.WriteLine("  Transfer delta-V required: " + transferDeltaV.ToString("F2") + " m/s");
+                Console.WriteLine("  Transfer orbit period: " + (transferResult.Period / 3600.0).ToString("F2") + " hours");
+                Console.WriteLine("  Transfer delta-V required (TLI): " + transferDeltaV.ToString("F2") + " m/s");
+                Console.WriteLine("  Expected range for TLI: ~3,100-3,300 m/s");
             }
 
             if (verbose)
@@ -141,8 +138,12 @@ namespace RocketScienceCleaned
 
             if (verbose)
             {
-                Console.WriteLine("  Lunar orbit velocity: " + lunarOrbitVelocity.ToString("F2") + " m/s");
+                Console.WriteLine("  Lunar orbit altitude: " + PhysicalConstants.LunarOrbitAltitude.ToString("F0") + " m");
+                Console.WriteLine("  Lunar orbit velocity (calculated): " + lunarOrbitVelocity.ToString("F2") + " m/s");
+                Console.WriteLine("  Expected range for 100 km lunar orbit: ~1,600-1,700 m/s");
+                Console.WriteLine("  Transfer apogee velocity: " + transferResult.ApogeeVelocity.ToString("F2") + " m/s");
                 Console.WriteLine("  Lunar orbit insertion delta-V: " + lunarOrbitInsertionDeltaV.ToString("F2") + " m/s");
+                Console.WriteLine("  Expected range for LOI: ~800-1,000 m/s");
             }
 
             if (verbose)
@@ -152,19 +153,38 @@ namespace RocketScienceCleaned
 
             LandingPhaseResult landingResult = CalculateLunarLanding(landingFuel, lunarOrbitVelocity, verbose);
             
+            parameters.LandingTime = landingResult.Time;
+            parameters.FinalVelocity = landingResult.FinalVelocity;
+            parameters.LandingDescentDeltaV = landingResult.DeltaV;
+            
+            parameters.TotalDeltaV = parameters.LaunchPhaseDeltaV + transferDeltaV + lunarOrbitInsertionDeltaV + landingResult.DeltaV;
+            
             if (!landingResult.Success)
             {
                 if (verbose)
                 {
-                    Console.WriteLine("  Landing phase failed: Insufficient fuel or thrust");
+                    if (landingResult.FuelDeficit > 0)
+                    {
+                        Console.WriteLine("  Landing phase failed: Fuel exhausted, deficit: " + landingResult.FuelDeficit.ToString("F2") + " kg");
+                        Console.WriteLine("  Failure at altitude: " + landingResult.AltitudeAtFailure.ToString("F0") + " m, velocity: " + landingResult.VelocityAtFailure.ToString("F2") + " m/s");
+                    }
+                    else
+                    {
+                        Console.WriteLine("  Landing phase failed: Insufficient fuel or thrust");
+                        Console.WriteLine("  Failure at altitude: " + landingResult.AltitudeAtFailure.ToString("F0") + " m, velocity: " + landingResult.VelocityAtFailure.ToString("F2") + " m/s");
+                    }
                 }
-                parameters.Cost = double.MaxValue;
-                return double.MaxValue;
+                
+                double altitudeRemaining = landingResult.AltitudeAtFailure;
+                double vFinal = Math.Abs(landingResult.VelocityAtFailure);
+                double vTarget = rocket.LandingSpeedTarget;
+                
+                penalty += w_land * (vFinal - vTarget) * (vFinal - vTarget);
+                penalty += w_alt * altitudeRemaining * altitudeRemaining;
+                
+                parameters.Cost = baseCost + penalty;
+                return baseCost + penalty;
             }
-
-            parameters.LandingTime = landingResult.Time;
-            parameters.FinalVelocity = landingResult.FinalVelocity;
-            parameters.LandingDescentDeltaV = landingResult.DeltaV;
 
             if (verbose)
             {
@@ -172,32 +192,36 @@ namespace RocketScienceCleaned
                 Console.WriteLine("  Final landing velocity: " + landingResult.FinalVelocity.ToString("F4") + " m/s");
             }
 
-            parameters.TotalDeltaV = parameters.LaunchPhaseDeltaV + transferDeltaV + lunarOrbitInsertionDeltaV + landingResult.DeltaV;
-
-            double speedDeviation = Math.Max(0, Math.Abs(parameters.FinalVelocity) - rocket.LandingSpeedTarget);
-            double penalty = Math.Pow(speedDeviation, 2) * 1e6;
-            parameters.CostPenalty = penalty;
-
-            if (verbose)
+            baseCost = parameters.TotalDeltaV;
+            double speedDeviation = Math.Abs(parameters.FinalVelocity - rocket.LandingSpeedTarget);
+            double totalFuelUsed = parameters.LaunchFuel + landingFuel;
+            
+            double landingSpeedPenalty = 0.0;
+            if (speedDeviation > 0.1)
             {
-                Console.WriteLine("  Landing speed deviation: " + speedDeviation.ToString("F4") + " m/s");
-                Console.WriteLine("  Speed penalty: " + penalty.ToString("F2"));
-                Console.WriteLine("  Total mission delta-V: " + parameters.TotalDeltaV.ToString("F2") + " m/s");
+                double penaltyWeight = 1e7;
+                if (parameters.FinalVelocity > rocket.LandingSpeedTarget + 0.5)
+                {
+                    penaltyWeight = 1e9;
+                }
+                else if (parameters.FinalVelocity > rocket.LandingSpeedTarget)
+                {
+                    penaltyWeight = 5e7;
+                }
+                landingSpeedPenalty = penaltyWeight * speedDeviation * speedDeviation;
+                
+                if (parameters.FinalVelocity > rocket.LandingSpeedTarget + 0.5)
+                {
+                    double excessSpeed = parameters.FinalVelocity - (rocket.LandingSpeedTarget + 0.5);
+                    landingSpeedPenalty += excessSpeed * excessSpeed * 1e9;
+                }
             }
-
-            double totalCost = parameters.LaunchTime + parameters.CoastTime + parameters.LandingTime + penalty;
-            parameters.Cost = totalCost;
-
-            if (verbose)
-            {
-                Console.WriteLine("  Cost components: Launch=" + parameters.LaunchTime.ToString("F2") + 
-                                "s, Coast=" + parameters.CoastTime.ToString("F2") + 
-                                "s, Landing=" + parameters.LandingTime.ToString("F2") + 
-                                "s, Penalty=" + penalty.ToString("F2"));
-                Console.WriteLine("  Total cost: " + totalCost.ToString("F2"));
-            }
-
-            return totalCost;
+            
+            baseCost += landingSpeedPenalty + totalFuelUsed;
+            parameters.CostPenalty = landingSpeedPenalty;
+            
+            parameters.Cost = baseCost + penalty;
+            return baseCost + penalty;
         }
 
         private LaunchPhaseResult CalculateLaunchPhase(double launchFuel, bool verbose)
@@ -285,10 +309,23 @@ namespace RocketScienceCleaned
             result.Time = currentTime;
             result.Altitude = altitude;
             result.Velocity = velocity;
-            result.DeltaV = CalculateDeltaVFromTsiolkovsky(initialMass, mass);
+            
+            // Launch delta-V should be the actual velocity achieved (includes gravity/drag losses)
+            // This is more accurate than using Tsiolkovsky which gives theoretical maximum
+            // For Earth launch to LEO, this should be ~9.3-10.0 km/s including losses
+            result.DeltaV = velocity;
             
             double circularOrbitVelAtAchievedAlt = CalculateCircularOrbitVelocity(PhysicalConstants.EarthRadius + altitude, PhysicalConstants.EarthMass);
             double velocityRatio = velocity / circularOrbitVelAtAchievedAlt;
+            
+            // Validation: check that achieved velocity is reasonable for the altitude
+            if (verbose)
+            {
+                Console.WriteLine("    Validation: Circular orbit velocity at achieved altitude: " + circularOrbitVelAtAchievedAlt.ToString("F2") + " m/s");
+                Console.WriteLine("    Validation: Achieved velocity: " + velocity.ToString("F2") + " m/s");
+                Console.WriteLine("    Validation: Velocity ratio: " + velocityRatio.ToString("F3"));
+            }
+            
             result.Success = altitude >= targetOrbitAltitude * 0.8 && velocityRatio >= 0.88;
 
             if (verbose)
@@ -325,9 +362,12 @@ namespace RocketScienceCleaned
             if (verbose)
             {
                 Console.WriteLine("    Hohmann transfer orbit calculated");
-                Console.WriteLine("    Perigee radius: " + r1.ToString("F0") + " m");
-                Console.WriteLine("    Apogee radius: " + r2.ToString("F0") + " m");
-                Console.WriteLine("    Semi-major axis: " + semiMajorAxis.ToString("F0") + " m");
+                Console.WriteLine("    Perigee radius (LEO): " + (r1 / 1000.0).ToString("F2") + " km");
+                Console.WriteLine("    Apogee radius (Moon distance): " + (r2 / 1000.0).ToString("F2") + " km");
+                Console.WriteLine("    Semi-major axis: " + (semiMajorAxis / 1000.0).ToString("F2") + " km");
+                Console.WriteLine("    Perigee velocity: " + perigeeVelocity.ToString("F2") + " m/s");
+                Console.WriteLine("    Apogee velocity: " + apogeeVelocity.ToString("F2") + " m/s");
+                Console.WriteLine("    Transfer period: " + (period / 3600.0).ToString("F2") + " hours");
             }
 
             return result;
@@ -335,161 +375,212 @@ namespace RocketScienceCleaned
 
         private LandingPhaseResult CalculateLunarLanding(double landingFuel, double initialOrbitVelocity, bool verbose)
         {
-            if (verbose)
-            {
-                Console.WriteLine("    Calculating descent from lunar orbit...");
-            }
-
             LandingPhaseResult result = new LandingPhaseResult();
             double timeStep = 0.1;
             double initialMass = rocket.Payload + landingFuel;
             double mass = initialMass;
             double altitude = PhysicalConstants.LunarOrbitAltitude;
-            double velocity = initialOrbitVelocity;
             double remainingLandingFuel = landingFuel;
             double currentTime = 0;
             const double maxTime = 7200;
-            const double targetDescentRate = 2.0;
-
-            if (verbose)
-            {
-                Console.WriteLine("    Initial mass: " + initialMass.ToString("F2") + " kg");
-                Console.WriteLine("    Initial altitude: " + altitude.ToString("F0") + " m");
-                Console.WriteLine("    Initial velocity: " + velocity.ToString("F2") + " m/s");
-                Console.WriteLine("    Target descent rate: " + targetDescentRate.ToString("F2") + " m/s");
-            }
-
-            int stepCount = 0;
             
-            while (altitude > 0 && remainingLandingFuel > 1.0 && currentTime < maxTime)
+            double vHorizontal = initialOrbitVelocity;
+            int brakeSteps = 0;
+            
+            while (vHorizontal > 5.0 && remainingLandingFuel > 0 && currentTime < maxTime)
+            {
+                if (remainingLandingFuel <= 0)
+                {
+                    result.Success = false;
+                    result.FuelDeficit = -remainingLandingFuel;
+                    result.AltitudeAtFailure = altitude;
+                    result.VelocityAtFailure = vHorizontal;
+                    result.Time = currentTime;
+                    result.FinalVelocity = vHorizontal;
+                    result.DeltaV = initialOrbitVelocity - vHorizontal;
+                    return result;
+                }
+                
+                double radius = PhysicalConstants.MoonRadius + altitude;
+                double gravity = PhysicalConstants.GravitationalConstant * PhysicalConstants.MoonMass / (radius * radius);
+                
+                double thrustAccel = rocket.Thrust / mass;
+                double maxFuelAvailable = remainingLandingFuel;
+                double maxThrustFromFuel = (maxFuelAvailable / timeStep) * rocket.ExhaustVelocity * rocket.BurnRate / rocket.Thrust;
+                if (maxThrustFromFuel < rocket.Thrust)
+                {
+                    thrustAccel = maxThrustFromFuel / mass;
+                }
+                
+                vHorizontal -= thrustAccel * timeStep;
+                
+                double fuelConsumed = Math.Min(rocket.BurnRate * timeStep, remainingLandingFuel);
+                remainingLandingFuel -= fuelConsumed;
+                mass -= fuelConsumed;
+                currentTime += timeStep;
+                brakeSteps++;
+            }
+            
+            double velocity = 0.0;
+            int descentSteps = 0;
+            double altitudeAtFailure = altitude;
+            double velocityAtFailure = velocity;
+            bool fuelExhausted = false;
+            double previousVelocity = velocity;
+            
+            while (altitude > 0 && currentTime < maxTime)
             {
                 double radius = PhysicalConstants.MoonRadius + altitude;
                 double gravity = PhysicalConstants.GravitationalConstant * PhysicalConstants.MoonMass / (radius * radius);
                 
-                double desiredDeceleration;
-                if (altitude > 50000)
+                double vTarget = 0.0;
+                double aCmd = 0.0;
+                double actualThrust = 0.0;
+                
+                if (altitude > 20000.0)
                 {
-                    if (velocity > 1500)
-                    {
-                        desiredDeceleration = 6.0;
-                    }
-                    else
-                    {
-                        desiredDeceleration = 8.0;
-                    }
+                    actualThrust = 0.0;
                 }
-                else if (altitude > 20000)
+                else if (altitude > 2000.0)
                 {
-                    if (velocity > 1200)
-                    {
-                        desiredDeceleration = 8.0;
-                    }
-                    else
-                    {
-                        desiredDeceleration = 10.0;
-                    }
-                }
-                else if (velocity > 1500)
-                {
-                    desiredDeceleration = 12.0;
-                }
-                else if (velocity > 1200)
-                {
-                    desiredDeceleration = 18.0;
-                }
-                else if (velocity > 800)
-                {
-                    desiredDeceleration = 35.0;
-                }
-                else if (velocity > 400)
-                {
-                    desiredDeceleration = 60.0;
-                }
-                else if (velocity > 100)
-                {
-                    desiredDeceleration = 75.0;
-                }
-                else if (velocity > 20)
-                {
-                    desiredDeceleration = 85.0;
+                    vTarget = -50.0;
+                    double velocityError = vTarget - velocity;
+                    double velocityDerivative = (velocity - previousVelocity) / timeStep;
+                    double kp = 1.8;
+                    double kd = 0.3;
+                    aCmd = (kp * velocityError - kd * velocityDerivative) / timeStep;
+                    double requiredThrust = mass * (aCmd + gravity);
+                    actualThrust = Math.Max(0.0, Math.Min(requiredThrust, rocket.Thrust));
                 }
                 else
                 {
-                    double timeToSurface = altitude / Math.Max(velocity, 1.0);
-                    double requiredDecel = (velocity - rocket.LandingSpeedTarget) / Math.Max(timeToSurface, 0.1);
-                    desiredDeceleration = Math.Min(requiredDecel, 35.0);
-                }
-                
-                double requiredThrustForDeceleration = (desiredDeceleration + gravity) * mass;
-                double actualThrust = Math.Min(requiredThrustForDeceleration, rocket.Thrust);
-                double thrustAccel = actualThrust / mass;
-                
-                double netAcceleration = thrustAccel - gravity;
-
-                if (netAcceleration <= 0 && velocity > 200.0 && altitude > 5000)
-                {
-                    if (verbose)
+                    double targetSpeed = rocket.LandingSpeedTarget;
+                    if (altitude > 1500.0)
                     {
-                        Console.WriteLine("    Insufficient thrust: net=" + netAcceleration.ToString("F4") + " m/s², v=" + velocity.ToString("F2") + " m/s, alt=" + altitude.ToString("F0") + "m");
+                        targetSpeed = 20.0 + (altitude - 1500.0) / 500.0 * 30.0;
                     }
-                    result.Success = false;
-                    return result;
+                    else if (altitude > 800.0)
+                    {
+                        targetSpeed = 12.0 + (altitude - 800.0) / 700.0 * 8.0;
+                    }
+                    else if (altitude > 400.0)
+                    {
+                        targetSpeed = 7.0 + (altitude - 400.0) / 400.0 * 5.0;
+                    }
+                    else if (altitude > 150.0)
+                    {
+                        targetSpeed = 4.5 + (altitude - 150.0) / 250.0 * 2.5;
+                    }
+                    else if (altitude > 30.0)
+                    {
+                        targetSpeed = rocket.LandingSpeedTarget + (altitude - 30.0) / 120.0 * 1.5;
+                    }
+                    else if (altitude > 10.0)
+                    {
+                        targetSpeed = rocket.LandingSpeedTarget + (altitude - 10.0) / 20.0 * 0.5;
+                    }
+                    else
+                    {
+                        targetSpeed = rocket.LandingSpeedTarget;
+                    }
+                    
+                    vTarget = -targetSpeed;
+                    double velocityError = vTarget - velocity;
+                    double velocityDerivative = (velocity - previousVelocity) / timeStep;
+                    
+                    double kp = 4.0;
+                    double kd = 0.5;
+                    if (altitude < 50.0)
+                    {
+                        kp = 8.0;
+                        kd = 1.0;
+                    }
+                    else if (altitude < 150.0)
+                    {
+                        kp = 6.0;
+                        kd = 0.8;
+                    }
+                    
+                    aCmd = (kp * velocityError - kd * velocityDerivative) / timeStep;
+                    double requiredThrust = mass * (aCmd + gravity);
+                    actualThrust = Math.Max(0.0, Math.Min(requiredThrust, rocket.Thrust));
                 }
-
-                velocity -= netAcceleration * timeStep;
                 
-                if (velocity < 0)
+                previousVelocity = velocity;
+                
+                if (actualThrust > 0 && remainingLandingFuel > 0)
                 {
-                    velocity = 0;
+                    double maxFuelAvailable = remainingLandingFuel;
+                    double maxThrustFromFuel = (maxFuelAvailable / timeStep) * rocket.ExhaustVelocity * rocket.BurnRate / rocket.Thrust;
+                    if (maxThrustFromFuel < actualThrust)
+                    {
+                        actualThrust = maxThrustFromFuel;
+                    }
+                    
+                    double fuelConsumed = Math.Min(rocket.BurnRate * timeStep, remainingLandingFuel);
+                    remainingLandingFuel -= fuelConsumed;
+                    mass -= fuelConsumed;
+                    
+                    if (remainingLandingFuel <= 0)
+                    {
+                        fuelExhausted = true;
+                        altitudeAtFailure = altitude;
+                        velocityAtFailure = velocity;
+                    }
                 }
                 
-                double descentDistance = velocity * timeStep;
-                altitude -= descentDistance;
+                double thrustAccel = actualThrust / mass;
+                double netAcceleration = thrustAccel - gravity;
+                velocity += netAcceleration * timeStep;
+                altitude += velocity * timeStep;
                 
-                if (altitude < 0)
+                if (altitude <= 0)
                 {
                     altitude = 0;
-                    if (velocity > rocket.LandingSpeedTarget + 1.0)
+                    double landingSpeed = Math.Abs(velocity);
+                    if (landingSpeed > rocket.LandingSpeedTarget + 0.5)
                     {
                         result.Success = false;
+                        result.FuelDeficit = remainingLandingFuel < 0 ? -remainingLandingFuel : 0;
+                        result.AltitudeAtFailure = altitude;
+                        result.VelocityAtFailure = velocity;
+                        result.Time = currentTime;
+                        result.FinalVelocity = landingSpeed;
+                        result.DeltaV = initialOrbitVelocity + landingSpeed;
                         return result;
                     }
                     break;
                 }
-
-                double fuelConsumed = rocket.BurnRate * timeStep;
-                remainingLandingFuel -= fuelConsumed;
-                mass -= fuelConsumed;
+                
+                if (fuelExhausted)
+                {
+                    result.Success = false;
+                    result.FuelDeficit = -remainingLandingFuel;
+                    result.AltitudeAtFailure = altitudeAtFailure;
+                    result.VelocityAtFailure = velocityAtFailure;
+                    result.Time = currentTime;
+                    result.FinalVelocity = Math.Abs(velocityAtFailure);
+                    result.DeltaV = initialOrbitVelocity + Math.Abs(velocityAtFailure);
+                    return result;
+                }
+                
                 currentTime += timeStep;
-                stepCount++;
-
-                if (verbose && (stepCount % 100 == 0 || altitude < 20000))
-                {
-                    Console.WriteLine("    Step " + stepCount + ": t=" + currentTime.ToString("F1") + 
-                                    "s, alt=" + altitude.ToString("F0") + "m, v=" + velocity.ToString("F2") + 
-                                    "m/s, mass=" + mass.ToString("F2") + "kg, netAccel=" + netAcceleration.ToString("F4") + "m/s², fuel=" + remainingLandingFuel.ToString("F2") + "kg");
-                }
-
-                if (altitude <= 0.1 && Math.Abs(velocity - rocket.LandingSpeedTarget) <= 0.5)
-                {
-                    break;
-                }
+                descentSteps++;
             }
-
+            
             result.Time = currentTime;
-            result.FinalVelocity = velocity;
-            result.DeltaV = CalculateDeltaVFromTsiolkovsky(initialMass, mass);
-            result.Success = altitude <= 200.0 && Math.Abs(velocity - rocket.LandingSpeedTarget) <= 10.0;
-
-            if (verbose)
+            double actualLandingSpeed = Math.Abs(velocity);
+            result.FinalVelocity = actualLandingSpeed;
+            result.DeltaV = initialOrbitVelocity + actualLandingSpeed;
+            result.Success = altitude <= 200.0 && actualLandingSpeed <= rocket.LandingSpeedTarget + 0.5;
+            
+            if (!result.Success)
             {
-                Console.WriteLine("    Landing phase complete: " + stepCount + " integration steps");
-                Console.WriteLine("    Final altitude: " + altitude.ToString("F0") + " meters");
-                Console.WriteLine("    Final velocity: " + velocity.ToString("F4") + " m/s");
-                Console.WriteLine("    Descent delta-V: " + result.DeltaV.ToString("F2") + " m/s");
-                Console.WriteLine("    Landing success: " + (result.Success ? "YES" : "NO"));
+                result.AltitudeAtFailure = altitude;
+                result.VelocityAtFailure = velocity;
+                result.FuelDeficit = remainingLandingFuel < 0 ? -remainingLandingFuel : 0;
             }
-
+            
             return result;
         }
 
@@ -542,6 +633,9 @@ namespace RocketScienceCleaned
             public double Time { get; set; }
             public double FinalVelocity { get; set; }
             public double DeltaV { get; set; }
+            public double FuelDeficit { get; set; }
+            public double AltitudeAtFailure { get; set; }
+            public double VelocityAtFailure { get; set; }
         }
     }
 }

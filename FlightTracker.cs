@@ -191,7 +191,9 @@ namespace RocketScienceCleaned
             Console.WriteLine("Mission Summary");
             Console.WriteLine($"  Starting Mass:          {rocket.Payload + rocket.TotalFuel:N0} kg");
             Console.WriteLine($"  Payload Mass:           {rocket.Payload:N0} kg");
-            Console.WriteLine($"  Mission Success:        {(parameters.FinalVelocity <= rocket.LandingSpeedTarget + 0.1 ? "YES" : "MARGINAL")}");
+            double speedDeviation = Math.Abs(parameters.FinalVelocity - rocket.LandingSpeedTarget);
+            bool missionSuccess = parameters.FinalVelocity <= rocket.LandingSpeedTarget + 0.5;
+            Console.WriteLine($"  Mission Success:        {(missionSuccess ? "YES" : "NO")}");
             Console.WriteLine();
         }
     }

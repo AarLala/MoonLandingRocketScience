@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 
 namespace RocketScienceCleaned
 {
@@ -7,177 +9,152 @@ namespace RocketScienceCleaned
         private readonly Rocket rocket;
         private readonly TrajectoryCalculator calculator;
         private readonly FlightTracker tracker;
+        private readonly string csvFilePath;
+        private List<double> mHistory;
+        private List<double> JHistory;
 
         public Optimizer(Rocket rocket, TrajectoryCalculator calculator, FlightTracker tracker)
         {
             this.rocket = rocket;
             this.calculator = calculator;
             this.tracker = tracker;
+            this.mHistory = new List<double>();
+            this.JHistory = new List<double>();
+            
+            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            this.csvFilePath = Path.Combine(desktopPath, "optimization_data.csv");
+            File.WriteAllText(csvFilePath, "iteration,landing_fuel,cost\n");
+            Console.WriteLine($"Saving optimization data to {csvFilePath}");
         }
 
-        public double OptimizeLandingFuel()
+        public double OptimizeLandingFuel(double initialGuess = double.NaN)
         {
-            double currentLandingFuel = rocket.TotalFuel * 0.32;
-            double learningRate = 0.01;
-            double tolerance = 1e-6;
-            double previousCost = double.MaxValue;
-            double currentCost = 0;
-            double previousLandingFuel = currentLandingFuel;
+            const double xmin = 0.30;
+            const double xmax = 0.60;
+            const double defaultRatio = 0.32;
+            const double gradTol = 1e-2;
+            const double speedTol = 3.5;
             const int maxIterations = 1000;
-
+            
+            double xInit = double.IsNaN(initialGuess) ? defaultRatio : (initialGuess / rocket.TotalFuel);
+            double y = Math.Log((xInit - xmin) / (xmax - xInit));
+            double x = Map(y, xmin, xmax);
+            double J = calculator.CalculateCost(x * rocket.TotalFuel, out _, false);
+            double alpha = 0.05;
+            
             tracker.StartOptimization();
-
-            Console.WriteLine("Initializing optimization parameters:");
-            Console.WriteLine("  Initial landing fuel guess: " + currentLandingFuel.ToString("F2") + " kg");
-            Console.WriteLine("  Learning rate: " + learningRate.ToString("F6"));
-            Console.WriteLine("  Convergence tolerance: " + tolerance.ToString("E"));
-            Console.WriteLine("  Maximum iterations: " + maxIterations);
-            Console.WriteLine();
-
-            for (int iteration = 0; iteration < maxIterations; iteration++)
+            
+            for (int iter = 0; iter < maxIterations; iter++)
             {
-                Console.WriteLine("ITERATION " + iteration.ToString("D4") + " START");
-                Console.WriteLine("Current landing fuel parameter: " + currentLandingFuel.ToString("F6") + " kg");
-                Console.WriteLine();
+                double g = ComputeGradient(y, J, xmin, xmax);
 
-                Console.WriteLine("Evaluating cost function at current point...");
-                currentCost = calculator.CalculateCost(currentLandingFuel, out FlightParameters currentParams, true);
-
-                if (currentCost == double.MaxValue)
+                if (!double.IsFinite(J) || !double.IsFinite(g))
                 {
-                    tracker.LogInvalidSolution(iteration, currentLandingFuel);
-                    if (iteration == 0)
-                    {
-                        currentLandingFuel = rocket.TotalFuel * 0.32;
-                        previousLandingFuel = currentLandingFuel;
-                        continue;
-                    }
-                    if (Math.Abs(currentLandingFuel - previousLandingFuel) < 1000)
-                    {
-                        currentLandingFuel = previousLandingFuel;
-                        break;
-                    }
-                    currentLandingFuel = previousLandingFuel;
+                    alpha *= 0.5;
                     continue;
                 }
 
-                Console.WriteLine();
-                Console.WriteLine("Computing analytical gradient...");
+                calculator.CalculateCost(x * rocket.TotalFuel, out FlightParameters checkParams, false);
+                double actualLandingSpeed = checkParams.FinalVelocity;
                 
-                double gradient = CalculateAnalyticalGradient(currentLandingFuel, currentParams, out double costPlus, out double costMinus);
-                currentParams.Gradient = gradient;
-
-                Console.WriteLine("Gradient calculation:");
-                Console.WriteLine("  Forward perturbation cost: " + costPlus.ToString("F2"));
-                Console.WriteLine("  Backward perturbation cost: " + costMinus.ToString("F2"));
-                Console.WriteLine("  Cost difference: " + (costPlus - costMinus).ToString("F6"));
-                Console.WriteLine("  Analytical gradient: " + gradient.ToString("F6"));
-                Console.WriteLine();
-
-                tracker.UpdateOptimizationProgress(iteration, currentLandingFuel, currentCost, previousCost, currentParams);
-
-                previousLandingFuel = currentLandingFuel;
-                double parameterUpdate = learningRate * gradient;
-                currentLandingFuel -= parameterUpdate;
-                double originalUpdate = currentLandingFuel;
-                currentLandingFuel = Math.Max(0, Math.Min(currentLandingFuel, rocket.TotalFuel));
-
-                Console.WriteLine("Parameter update:");
-                Console.WriteLine("  Previous landing fuel: " + previousLandingFuel.ToString("F6") + " kg");
-                Console.WriteLine("  Update amount: " + parameterUpdate.ToString("F6") + " kg (learning rate * gradient)");
-                Console.WriteLine("  Unconstrained new value: " + originalUpdate.ToString("F6") + " kg");
-                
-                if (currentLandingFuel != originalUpdate)
+                if (Math.Abs(g) < gradTol && actualLandingSpeed <= speedTol)
                 {
-                    Console.WriteLine("  Constraint applied: Clamped to bounds [0, " + rocket.TotalFuel.ToString("F2") + "]");
+                    Console.WriteLine($"Optimization converged after {iter} iterations");
+                    Console.WriteLine($"Landing speed: {actualLandingSpeed:F4} m/s (target: ≤{speedTol:F1} m/s)");
+                    break;
                 }
                 
-                Console.WriteLine("  New landing fuel: " + currentLandingFuel.ToString("F6") + " kg");
-                Console.WriteLine("  Parameter change: " + (currentLandingFuel - previousLandingFuel).ToString("F6") + " kg");
-                Console.WriteLine();
-
-                if (iteration > 0)
+                if (Math.Abs(g) < gradTol && actualLandingSpeed > speedTol)
                 {
-                    double costChange = currentCost - previousCost;
-                    Console.WriteLine("Convergence check:");
-                    Console.WriteLine("  Previous cost: " + previousCost.ToString("F6"));
-                    Console.WriteLine("  Current cost: " + currentCost.ToString("F6"));
-                    Console.WriteLine("  Cost change: " + costChange.ToString("F6"));
-                    Console.WriteLine("  Absolute cost change: " + Math.Abs(costChange).ToString("E"));
-                    Console.WriteLine("  Tolerance: " + tolerance.ToString("E"));
-                    
-                    if (Math.Abs(costChange) < tolerance)
+                    Console.WriteLine($"Gradient converged but landing speed too high ({actualLandingSpeed:F4} m/s > {speedTol:F1} m/s), continuing optimization...");
+                }
+
+                double gNorm = g / (Math.Abs(g) + 1.0);
+                bool accepted = false;
+                double alphaTry = alpha;
+
+                for (int ls = 0; ls < 20; ls++)
+                {
+                    double yNew = y - alphaTry * gNorm;
+                    double xNew = Map(yNew, xmin, xmax);
+                    double JNew = calculator.CalculateCost(xNew * rocket.TotalFuel, out _, false);
+
+                    if (double.IsFinite(JNew) && JNew <= J)
                     {
-                        Console.WriteLine("  Convergence criterion met!");
-                        Console.WriteLine();
-                        tracker.LogConvergence(iteration);
+                        y = yNew;
+                        x = xNew;
+                        J = JNew;
+                        accepted = true;
                         break;
                     }
-                    else
-                    {
-                        Console.WriteLine("  Continuing optimization...");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("First iteration: No convergence check");
+                    alphaTry *= 0.5;
                 }
 
-                previousCost = currentCost;
-                Console.WriteLine();
-                Console.WriteLine("ITERATION " + iteration.ToString("D4") + " COMPLETE");
-                Console.WriteLine();
+                if (!accepted)
+                {
+                    alpha *= 0.5;
+                    if (alpha < 1e-12)
+                    {
+                        Console.WriteLine($"Step size became too small, stopping optimization");
+                        break;
+                    }
+                }
+                
+                LogToCSV(iter, x * rocket.TotalFuel, J);
+                mHistory.Add(x * rocket.TotalFuel);
+                JHistory.Add(J);
             }
 
             tracker.CompleteOptimization();
-            return currentLandingFuel;
+            double finalX = Map(y, xmin, xmax);
+            return finalX * rocket.TotalFuel;
         }
 
-        private double CalculateAnalyticalGradient(double landingFuel, FlightParameters currentParams, out double costPlus, out double costMinus)
+        private static double Map(double y, double xmin, double xmax)
         {
-            double currentCost = currentParams.Cost;
-            double delta = Math.Max(1000.0, landingFuel * 0.002);
-            costPlus = calculator.CalculateCost(landingFuel + delta, out _, false);
-            costMinus = calculator.CalculateCost(landingFuel - delta, out _, false);
+            return xmin + (xmax - xmin) / (1 + Math.Exp(-y));
+        }
+
+        public List<double> GetMHistory() => mHistory;
+        public List<double> GetJHistory() => JHistory;
+
+        private double ComputeGradient(double y, double currentCost, double xmin, double xmax)
+        {
+            double eps = 1e-4;
             
-            if (costPlus == double.MaxValue && costMinus == double.MaxValue)
+            for (int retry = 0; retry < 5; retry++)
             {
-                return 0;
+                double yPlus = y + eps;
+                double yMinus = y - eps;
+                
+                double xPlus = Map(yPlus, xmin, xmax);
+                double xMinus = Map(yMinus, xmin, xmax);
+                
+                double landingFuelPlus = xPlus * rocket.TotalFuel;
+                double landingFuelMinus = xMinus * rocket.TotalFuel;
+                
+                double costPlus = calculator.CalculateCost(landingFuelPlus, out _, false);
+                double costMinus = calculator.CalculateCost(landingFuelMinus, out _, false);
+                
+                if (double.IsFinite(costPlus) && double.IsFinite(costMinus))
+                {
+                    double gradient = (costPlus - costMinus) / (2 * eps);
+                    if (double.IsFinite(gradient))
+                    {
+                        return gradient;
+                    }
+                }
+                
+                eps *= 0.1;
             }
             
-            if (costPlus == double.MaxValue)
-            {
-                if (costMinus != double.MaxValue && costMinus < currentCost)
-                {
-                    return (costMinus - currentCost) / delta;
-                }
-                return 0.01;
-            }
-            
-            if (costMinus == double.MaxValue)
-            {
-                if (costPlus != double.MaxValue && costPlus < currentCost)
-                {
-                    return (currentCost - costPlus) / delta;
-                }
-                return -0.01;
-            }
-            
-            double gradient = (costPlus - costMinus) / (2 * delta);
-            
-            if (Math.Abs(gradient) < 1e-10)
-            {
-                if (costPlus < currentCost)
-                {
-                    return -0.001;
-                }
-                if (costMinus < currentCost)
-                {
-                    return 0.001;
-                }
-            }
-            
-            return gradient;
+            return 0.0;
+        }
+
+        private void LogToCSV(int iteration, double landingFuel, double cost)
+        {
+            string line = $"{iteration},{landingFuel:F6},{cost:F6}\n";
+            File.AppendAllText(csvFilePath, line);
         }
     }
 }
